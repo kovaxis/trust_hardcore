@@ -1,3 +1,4 @@
+use rand::Rng;
 use std::{
     collections::HashSet,
     env,
@@ -10,14 +11,21 @@ use std::{
     thread,
     time::Duration,
 };
-use rand::{Rng};
 
 fn bytes_to_string(mut bytes: &[u8]) -> String {
-    while bytes.first().map(|ch| ch.is_ascii_whitespace()).unwrap_or(false) {
-        bytes=&bytes[1..];
+    while bytes
+        .first()
+        .map(|ch| ch.is_ascii_whitespace())
+        .unwrap_or(false)
+    {
+        bytes = &bytes[1..];
     }
-    while bytes.last().map(|ch| ch.is_ascii_whitespace()).unwrap_or(false) {
-        bytes=&bytes[..bytes.len()-1];
+    while bytes
+        .last()
+        .map(|ch| ch.is_ascii_whitespace())
+        .unwrap_or(false)
+    {
+        bytes = &bytes[..bytes.len() - 1];
     }
     String::from_utf8_lossy(&bytes).to_string()
 }
@@ -146,16 +154,30 @@ fn start_server(path: &Path) -> Result<(Child, Sender<String>, Receiver<String>)
 }
 
 fn on_death<'a>(username: &'a str, input: &Sender<String>) -> Result<Option<&'a str>, Box<Error>> {
-    eprintln!("player {} died", username);
-    let cmd=|msg: String| {
+    eprintln!("player {} died, rolling dice", username);
+    let cmd = |msg: String| {
         input.send(msg).unwrap();
     };
-    let sleep=|time: f32| {
-        thread::sleep(Duration::from_millis((time*1000.0) as u64));
+    let sleep = |time: f32| {
+        thread::sleep(Duration::from_millis((time * 1000.0) as u64));
     };
-    cmd(format!("say Game over, {} died", username));
-    sleep(4.0);
-    Ok(Some(username))
+    cmd(format!("say {} died", username));
+    sleep(3.0);
+    cmd(format!("say Rolling dice..."));
+    sleep(6.0);
+    let num = rand::thread_rng().gen_range(1, 21);
+    cmd(format!("say Rolled {}", num));
+    sleep(2.0);
+    let death = [1, 4, 7, 9, 13].iter().any(|&n| n == num);
+    if death {
+        cmd(format!("say Always lucky boii"));
+        eprintln!("rolled deadly number");
+        Ok(Some(username))
+    } else {
+        cmd(format!("say Safe"));
+        eprintln!("rolled safe number");
+        Ok(None)
+    }
 }
 
 /// Boolean indicates whether to continue running.
@@ -202,7 +224,7 @@ fn run_server(
         if death_msg.iter().any(|dm| msg.starts_with(dm)) {
             //Player died
             if let Some(_username) = on_death(username, &input)? {
-                reset=true;
+                reset = true;
                 break;
             }
         }
