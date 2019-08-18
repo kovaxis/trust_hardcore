@@ -1,4 +1,6 @@
 use rand::Rng;
+use serde_derive::Deserialize;
+use serde_json as json;
 use std::{
     collections::HashSet,
     env,
@@ -9,8 +11,26 @@ use std::{
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[derive(Deserialize)]
+struct Config {
+    server: PathBuf,
+    world: PathBuf,
+    lang: PathBuf,
+    backup_dir: PathBuf,
+    players: Vec<String>,
+    checkpoint_minutes: u64,
+    roll_range: (i32, i32),
+    deadly_rolls: Vec<i32>,
+}
+
+enum Penalty {
+    None,
+    Rewind,
+    Reset,
+}
 
 fn bytes_to_string(mut bytes: &[u8]) -> String {
     while bytes
@@ -45,39 +65,44 @@ fn read_pipe<R: Read + Send + 'static>(pipe: R, sendback: &Sender<String>) {
     });
 }
 
-/// Parse player file.
-fn parse_players(path: &Path) -> Result<HashSet<String>, Box<Error>> {
-    let file = BufReader::new(File::open(path)?);
-    let mut players = HashSet::new();
-    'read_lines: for (i, line) in file.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue 'read_lines;
-        }
-        for c in line.chars() {
-            if !(c.is_alphanumeric() || c.is_whitespace()) {
-                eprintln!("invalid player in line {}", i + 1);
-                continue 'read_lines;
+fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
+    macro_rules! ensure {
+        ($cond:expr, $($tt:tt)*) => {{
+            if !$cond {
+                return Err(format!($($tt)*).into());
             }
-        }
-        //Add this player
-        players.insert(line.to_string());
+        }};
     }
-    eprintln!(
-        "{} deadly players: {}",
-        players.len(),
-        players
-            .iter()
-            .map(|s| &**s)
-            .collect::<Vec<&str>>()
-            .join(", ")
+    let conf: Config = json::from_reader(File::open(path)?)?;
+    ensure!(
+        conf.server.extension() == Some("jar".as_ref()),
+        "server must be a .jar file"
     );
-    Ok(players)
+    ensure!(
+        !conf.world.exists() || fs::metadata(&conf.world)?.is_dir(),
+        "world must be a directory"
+    );
+    ensure!(
+        conf.backup_dir.exists() && fs::metadata(&conf.backup_dir)?.is_dir(),
+        "backup must be a directory"
+    );
+    ensure!(
+        conf.roll_range.0 <= conf.roll_range.1,
+        "start of roll range must be smaller than its end"
+    );
+    for &num in &conf.deadly_rolls {
+        if num < conf.roll_range.0 || num > conf.roll_range.1 {
+            eprintln!(
+                "warning: deadly roll {} is outside of roll range [{}, {}]",
+                num, conf.roll_range.0, conf.roll_range.1
+            );
+        }
+    }
+    Ok(conf)
 }
 
 /// "Parse" lang file.
-fn parse_lang(path: &Path) -> Result<Vec<String>, Box<Error>> {
+fn parse_lang(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let mut death_msg = Vec::new();
     let lang = BufReader::new(File::open(path)?);
     for line in lang.lines() {
@@ -90,8 +115,8 @@ fn parse_lang(path: &Path) -> Result<Vec<String>, Box<Error>> {
                 let msg = &line[from_idx + pat.len()..];
                 let msg_len = msg
                     .find(|c: char| {
-                        //Only include alphanumeric/whitespace characters
-                        !(c.is_alphanumeric() || c.is_whitespace())
+                        //Only include alphanumeric/whitespace/apostrophe characters
+                        !(c.is_alphanumeric() || c.is_whitespace() || c=='\'')
                     })
                     .unwrap_or(msg.len());
                 //Insert this message
@@ -106,7 +131,7 @@ fn parse_lang(path: &Path) -> Result<Vec<String>, Box<Error>> {
     Ok(death_msg)
 }
 
-fn start_server(path: &Path) -> Result<(Child, Sender<String>, Receiver<String>), Box<Error>> {
+fn start_server(path: &Path) -> Result<(Child, Sender<String>, Receiver<String>), Box<dyn Error>> {
     //Start server
     eprintln!("starting server jar on \"{}\"", path.display());
     let mut server = Command::new("java")
@@ -121,6 +146,13 @@ fn start_server(path: &Path) -> Result<(Child, Sender<String>, Receiver<String>)
         let (out_tx, out_rx) = mpsc::channel::<String>();
         read_pipe(server.stdout.take().unwrap(), &out_tx);
         read_pipe(server.stderr.take().unwrap(), &out_tx);
+        //Send periodic empty messages
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(10));
+            if let Err(_closed) = out_tx.send(String::new()) {
+                break;
+            }
+        });
         out_rx
     };
 
@@ -153,7 +185,11 @@ fn start_server(path: &Path) -> Result<(Child, Sender<String>, Receiver<String>)
     Ok((server, input, output))
 }
 
-fn on_death<'a>(username: &'a str, input: &Sender<String>) -> Result<Option<&'a str>, Box<Error>> {
+fn on_death<'a>(
+    config: &Config,
+    username: &'a str,
+    input: &Sender<String>,
+) -> Result<Penalty, Box<dyn Error>> {
     eprintln!("player {} died, rolling dice", username);
     let cmd = |msg: String| {
         input.send(msg).unwrap();
@@ -165,36 +201,150 @@ fn on_death<'a>(username: &'a str, input: &Sender<String>) -> Result<Option<&'a 
     sleep(3.0);
     cmd(format!("say Rolling dice..."));
     sleep(6.0);
-    let num = rand::thread_rng().gen_range(1, 21);
+    let num = rand::thread_rng().gen_range(config.roll_range.0, config.roll_range.1 + 1);
     cmd(format!("say Rolled {}", num));
     sleep(2.0);
-    let death = [1, 4, 7, 9, 13].iter().any(|&n| n == num);
+    let death = config.deadly_rolls.iter().any(|&n| n == num);
     if death {
         cmd(format!("say Always lucky boii"));
-        eprintln!("rolled deadly number");
-        Ok(Some(username))
+        sleep(1.0);
+        eprintln!("rolled bad number");
+        Ok(Penalty::Reset)
     } else {
-        cmd(format!("say Safe"));
-        eprintln!("rolled safe number");
-        Ok(None)
+        eprintln!("rolled good number");
+        Ok(Penalty::Rewind)
     }
 }
 
-/// Boolean indicates whether to continue running.
-fn run_server(
-    server_path: &Path,
-    lang_path: &Path,
+fn save_playtime(world_path: &Path, playtime: Duration) -> Result<(), Box<dyn Error>> {
+    let path = world_path.join("playtime.txt");
+    let mut file = File::create(&path)?;
+    write!(file, "{}", playtime.as_secs())?;
+    Ok(())
+}
+
+fn load_playtime(world_path: &Path) -> Result<Duration, Box<dyn Error>> {
+    let path = world_path.join("playtime.txt");
+    let playtime = fs::read_to_string(&path)?;
+    let playtime: u64 = playtime.parse()?;
+    Ok(Duration::from_secs(playtime))
+}
+
+fn copy_dir(from: &mut PathBuf, to: &mut PathBuf) -> Result<(), Box<dyn Error>> {
+    if !to.exists() {
+        fs::create_dir(&*to)?;
+    }
+    for entry in fs::read_dir(&*from)? {
+        let name = entry?.file_name();
+        from.push(&name);
+        to.push(&name);
+        if let Ok(meta) = from.metadata() {
+            if meta.is_dir() {
+                copy_dir(from, to)?;
+            } else if meta.is_file() {
+                fs::copy(&*from, &*to)?;
+            }
+        }
+        from.pop();
+        to.pop();
+    }
+    Ok(())
+}
+
+fn make_backup(
     world_path: &Path,
-    players_path: &Path,
-) -> Result<bool, Box<Error>> {
-    //Parse configuration
-    let players = parse_players(players_path)?;
-    let death_msg = parse_lang(lang_path)?;
+    backup_path: &Path,
+    input: &Sender<String>,
+) -> Result<(), Box<dyn Error>> {
+    eprintln!("making backup");
+    //Remove old backup
+    if backup_path.exists() {
+        fs::remove_dir_all(&backup_path)?;
+    }
+    //Force server to backup
+    input.send(format!("save-all")).unwrap();
+    thread::sleep(Duration::from_secs(5));
+    input.send(format!("save-off")).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    //Copy save file
+    copy_dir(
+        &mut world_path.to_path_buf(),
+        &mut backup_path.to_path_buf(),
+    )?;
+    //Re-enable saving
+    input.send(format!("save-on")).unwrap();
+    input.send(format!("say Checkpoint!")).unwrap();
+    Ok(())
+}
+
+fn update_playtime(
+    config: &Config,
+    players_online_since: &mut Option<Instant>,
+    playtime: &mut Duration,
+) -> Result<bool, Box<dyn Error>> {
+    if let Some(since) = players_online_since {
+        //Advance playtime
+        let now = Instant::now();
+        let adv = now - *since;
+        if adv > Duration::from_secs(8) {
+            let old_playtime = *playtime;
+            *playtime += adv;
+            *since = now;
+            eprintln!("advancing by {}ms", adv.as_millis());
+            eprintln!("new playtime: {}ms", playtime.as_millis());
+            //Save playtime
+            save_playtime(&*config.world, *playtime)?;
+            //Make backup if advanced past the boundary
+            let backup_interval = config.checkpoint_minutes * 60;
+            let backup_count =
+                |playtime: Duration| (playtime.as_secs() + backup_interval - 30) / backup_interval;
+            if backup_count(*playtime) > backup_count(old_playtime) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Boolean indicates whether to continue running.
+fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
+    //Load config
+    let mut config = load_config(config_path)?;
+    let backup_path = config.backup_dir.join(
+        config
+            .world
+            .file_name()
+            .ok_or("no world name (invalid world path)")?,
+    );
+    let backup_path = &*backup_path;
+    let world_path = &*config.world;
+    let players = {
+        let mut players = HashSet::new();
+        eprintln!("{} deadly players:", config.players.len());
+        for player in config.players.drain(..) {
+            eprintln!("    {}", player);
+            players.insert(player);
+        }
+        players
+    };
+    let death_msg = parse_lang(config.lang.as_ref())?;
+    //Keep track of online players
+    let mut online_players = HashSet::new();
+    let mut players_online_since = None;
+    let mut playtime = load_playtime(world_path).unwrap_or_else(|err| {
+        eprintln!("failed to read playtime: {}", err);
+        Duration::from_secs(0)
+    });
+    eprintln!("have played for {} seconds", playtime.as_secs());
     //Start server
-    let (mut server, input, output) = start_server(server_path)?;
+    let (mut server, input, output) = start_server(&*config.server)?;
     //Parse output to detect deaths
-    let mut reset = false;
+    let mut penalty = Penalty::None;
     'read_line: for line in output.iter() {
+        //Bookkeep playtime
+        if update_playtime(&config, &mut players_online_since, &mut playtime)? {
+            make_backup(world_path, backup_path, &input)?;
+        }
         //Clean the message of prefixes
         let line = {
             let mut line = &line[..];
@@ -223,9 +373,26 @@ fn run_server(
         //Compare with death messages
         if death_msg.iter().any(|dm| msg.starts_with(dm)) {
             //Player died
-            if let Some(_username) = on_death(username, &input)? {
-                reset = true;
-                break;
+            penalty = on_death(&config, username, &input)?;
+            match penalty {
+                Penalty::Rewind | Penalty::Reset => break,
+                _ => (),
+            }
+        } else if msg.starts_with(" joined the game") {
+            if online_players.is_empty() {
+                //Start counting time
+                eprintln!("started counting time");
+                players_online_since = Some(Instant::now());
+            }
+            eprintln!("{} went online", username);
+            online_players.insert(username);
+        } else if msg.starts_with(" left the game") {
+            eprintln!("{} went offline", username);
+            online_players.remove(username);
+            if online_players.is_empty() {
+                //Stop counting time
+                eprintln!("stopped counting time");
+                players_online_since = None;
             }
         }
         //Stop if server stopped
@@ -233,49 +400,66 @@ fn run_server(
             break;
         }
     }
-    if reset {
-        //Reset world
-        eprintln!("resetting world");
-        //Stop server
-        input.send(format!("say Destroying world...")).unwrap();
-        thread::sleep(Duration::from_secs(2));
-        input.send(format!("stop")).unwrap();
-        //Wait for server to actually stop
-        server.wait()?;
-        //Delete world
-        eprintln!("deleting world directory on \"{}\"", world_path.display());
-        fs::remove_dir_all(&world_path)?;
-        //Continue running
-        Ok(true)
-    } else {
-        //Stop running
-        Ok(false)
+    match penalty {
+        Penalty::None => {
+            //Stop running
+            Ok(false)
+        }
+        Penalty::Rewind if backup_path.exists() => {
+            //Restore backup
+            eprintln!("restoring backup");
+            //Stop server
+            input.send(format!("say Winding back...")).unwrap();
+            thread::sleep(Duration::from_secs(2));
+            input.send(format!("stop")).unwrap();
+            //Wait for server to actually stop
+            server.wait()?;
+            //Delete world
+            eprintln!("deleting world directory on \"{}\"", world_path.display());
+            fs::remove_dir_all(&world_path)?;
+            //Restore backup
+            eprintln!(
+                "copying backup directory \"{}\" to world directory \"{}\"",
+                backup_path.display(),
+                world_path.display()
+            );
+            copy_dir(
+                &mut backup_path.to_path_buf(),
+                &mut world_path.to_path_buf(),
+            )?;
+            //save_playtime(world_path, playtime)?;
+            //Continue running
+            Ok(true)
+        }
+        _ => {
+            //Reset world
+            eprintln!("resetting world");
+            //Stop server
+            input.send(format!("say Destroying world...")).unwrap();
+            thread::sleep(Duration::from_secs(2));
+            input.send(format!("stop")).unwrap();
+            //Wait for server to actually stop
+            server.wait()?;
+            //Delete world
+            eprintln!("deleting world directory on \"{}\"", world_path.display());
+            fs::remove_dir_all(&world_path)?;
+            //Delete backup
+            if backup_path.exists() {
+                eprintln!("deleting backup directory on \"{}\"", backup_path.display());
+                fs::remove_dir_all(backup_path)?;
+            }
+            //Continue running
+            Ok(true)
+        }
     }
 }
 
-fn run() -> Result<(), Box<Error>> {
+fn run() -> Result<(), Box<dyn Error>> {
     //Parse args
     let mut args = env::args_os().skip(1);
-    let server = PathBuf::from(args.next().ok_or("no server path")?);
-    if server.extension() != Some("jar".as_ref()) {
-        return Err("server must be a .jar file".into());
-    }
-    let lang = PathBuf::from(args.next().ok_or("no lang path")?);
-    let world = PathBuf::from(args.next().ok_or("no world path")?);
-    if world.exists() && !fs::metadata(&world)?.is_dir() {
-        return Err("world must be a directory".into());
-    }
-    let players = PathBuf::from(args.next().ok_or("no players path")?);
-    if players.extension() != Some("txt".as_ref()) {
-        return Err("players must be a .txt file".into());
-    }
+    let config = args.next().ok_or("no config path supplied")?;
     //Run server
-    while run_server(
-        server.as_ref(),
-        lang.as_ref(),
-        world.as_ref(),
-        players.as_ref(),
-    )? {
+    while run_server(config.as_ref())? {
         eprintln!();
         eprintln!();
     }
@@ -290,7 +474,7 @@ fn main() {
             eprintln!();
             eprintln!("full error: {:?}", err);
             eprintln!();
-            eprintln!("usage: trust_hardcore <server> <lang> <world> <players>");
+            eprintln!("usage: trust_hardcore <config>");
         }
     }
 }

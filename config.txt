@@ -1,0 +1,10 @@
+{
+	"server": "server.jar",
+	"world": "world",
+	"lang": "en_us.json",
+	"backup_dir": ".",
+	"players": ["negamartin"],
+	"checkpoint_minutes": 60,
+	"roll_range": [1, 20],
+	"deadly_rolls": [1, 4, 7, 9, 13]
+}
