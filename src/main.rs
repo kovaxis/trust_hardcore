@@ -24,6 +24,7 @@ struct Config {
     checkpoint_minutes: u64,
     roll_range: (i32, i32),
     deadly_rolls: Vec<i32>,
+    bracket_count: u32,
 }
 
 enum Penalty {
@@ -349,7 +350,7 @@ fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
         let line = {
             let mut line = &line[..];
             //Strip the first few `[...]`
-            for _ in 0..3 {
+            for _ in 0..config.bracket_count {
                 match line.find(']') {
                     Some(bracket) => line = &line[bracket + 1..],
                     None => continue 'read_line,

@@ -6,5 +6,6 @@
 	"players": ["negamartin"],
 	"checkpoint_minutes": 60,
 	"roll_range": [1, 20],
-	"deadly_rolls": [1, 4, 7, 9, 13]
+	"deadly_rolls": [1, 4, 7, 9, 13],
+	"bracket_count": 3
 }
