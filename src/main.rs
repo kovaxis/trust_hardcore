@@ -30,7 +30,7 @@ struct Config {
     bracket_count: u32,
 }
 
-const USERNAME_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+const USERNAME_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-0123456789";
 fn is_username_char(c: char) -> bool {
     let mut is_username = [false; 128];
     for &c in USERNAME_CHARS.as_bytes().iter() {
@@ -229,7 +229,7 @@ fn on_death<'a>(
         Ok(Penalty::Reset)
     } else {
         eprintln!("rolled good number");
-        Ok(Penalty::Rewind)
+        Ok(Penalty::None)
     }
 }
 
