@@ -16,15 +16,27 @@ use std::{
 
 #[derive(Deserialize)]
 struct Config {
-    server: PathBuf,
+    server: Vec<String>,
     world: PathBuf,
     lang: PathBuf,
+    make_backups: bool,
     backup_dir: PathBuf,
     players: Vec<String>,
+    allow_all_players: bool,
+    on_death_command: Option<String>,
     checkpoint_minutes: u64,
     roll_range: (i32, i32),
     deadly_rolls: Vec<i32>,
     bracket_count: u32,
+}
+
+const USERNAME_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+fn is_username_char(c: char) -> bool {
+    let mut is_username = [false; 128];
+    for &c in USERNAME_CHARS.as_bytes().iter() {
+        is_username[c as usize] = true;
+    }
+    (c as u32) < 128 && is_username[c as usize]
 }
 
 enum Penalty {
@@ -75,10 +87,10 @@ fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
         }};
     }
     let conf: Config = json::from_reader(File::open(path)?)?;
-    ensure!(
+    /*ensure!(
         conf.server.extension() == Some("jar".as_ref()),
         "server must be a .jar file"
-    );
+    );*/
     ensure!(
         !conf.world.exists() || fs::metadata(&conf.world)?.is_dir(),
         "world must be a directory"
@@ -117,7 +129,7 @@ fn parse_lang(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
                 let msg_len = msg
                     .find(|c: char| {
                         //Only include alphanumeric/whitespace/apostrophe characters
-                        !(c.is_alphanumeric() || c.is_whitespace() || c=='\'')
+                        !(c.is_alphanumeric() || c.is_whitespace() || c == '\'')
                     })
                     .unwrap_or(msg.len());
                 //Insert this message
@@ -132,12 +144,13 @@ fn parse_lang(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(death_msg)
 }
 
-fn start_server(path: &Path) -> Result<(Child, Sender<String>, Receiver<String>), Box<dyn Error>> {
+fn start_server(
+    cmd: &[String],
+) -> Result<(Child, Sender<String>, Receiver<String>), Box<dyn Error>> {
     //Start server
-    eprintln!("starting server jar on \"{}\"", path.display());
-    let mut server = Command::new("java")
-        .arg("-jar")
-        .arg(&path)
+    eprintln!("starting server jar using command \"{:?}\"", cmd);
+    let mut server = Command::new(&cmd[0])
+        .args(&cmd[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -195,6 +208,9 @@ fn on_death<'a>(
     let cmd = |msg: String| {
         input.send(msg).unwrap();
     };
+    if let Some(death_cmd) = config.on_death_command.as_ref() {
+        cmd(death_cmd.replace("{username}", username));
+    }
     let sleep = |time: f32| {
         thread::sleep(Duration::from_millis((time * 1000.0) as u64));
     };
@@ -343,7 +359,9 @@ fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
     let mut penalty = Penalty::None;
     'read_line: for line in output.iter() {
         //Bookkeep playtime
-        if update_playtime(&config, &mut players_online_since, &mut playtime)? {
+        if update_playtime(&config, &mut players_online_since, &mut playtime)?
+            && config.make_backups
+        {
             make_backup(world_path, backup_path, &input)?;
         }
         //Clean the message of prefixes
@@ -356,25 +374,25 @@ fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
                     None => continue 'read_line,
                 };
             }
-            //Advance until an alphanumeric character is reached
-            match line.find(|c: char| c.is_alphanumeric()) {
+            //Advance until a username character is reached
+            match line.find(is_username_char) {
                 Some(line_start) => &line[line_start..],
                 None => continue 'read_line,
             }
         };
         //Player name is the first word
         let msg_start = line
-            .find(|c: char| !c.is_alphanumeric())
+            .find(|c: char| !is_username_char(c))
             .unwrap_or(line.len());
         let (username, msg) = line.split_at(msg_start);
-        let username = match players.get(username) {
-            Some(un) => &*un,
-            None => continue 'read_line,
-        };
+        let username = username.to_string();
+        if !config.allow_all_players && !players.contains(&username) {
+            continue 'read_line;
+        }
         //Compare with death messages
         if death_msg.iter().any(|dm| msg.starts_with(dm)) {
             //Player died
-            penalty = on_death(&config, username, &input)?;
+            penalty = on_death(&config, &username, &input)?;
             match penalty {
                 Penalty::Rewind | Penalty::Reset => break,
                 _ => (),
@@ -389,7 +407,7 @@ fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
             online_players.insert(username);
         } else if msg.starts_with(" left the game") {
             eprintln!("{} went offline", username);
-            online_players.remove(username);
+            online_players.remove(&username);
             if online_players.is_empty() {
                 //Stop counting time
                 eprintln!("stopped counting time");

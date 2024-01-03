@@ -4,6 +4,8 @@
 	"lang": "en_us.json",
 	"backup_dir": ".",
 	"players": ["negamartin"],
+	"allow_all_players": true,
+	"on_death_command": "execute at {username} run summon minecraft:creeper ~ ~ ~ {Fuse:0,powered:1,ignited:1,ExplosionRadius:30,Invulnerable:1}",
 	"checkpoint_minutes": 60,
 	"roll_range": [1, 20],
 	"deadly_rolls": [1, 4, 7, 9, 13],
