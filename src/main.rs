@@ -19,6 +19,7 @@ struct Config {
     server: Vec<String>,
     world: PathBuf,
     lang: PathBuf,
+    ignore_phrases: Vec<String>,
     make_backups: bool,
     backup_dir: PathBuf,
     players: Vec<String>,
@@ -390,7 +391,9 @@ fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
             continue 'read_line;
         }
         //Compare with death messages
-        if death_msg.iter().any(|dm| msg.starts_with(dm)) {
+        if death_msg.iter().any(|dm| msg.starts_with(dm))
+            && !death_msg.iter().any(|dm| msg.starts_with(dm))
+        {
             //Player died
             penalty = on_death(&config, &username, &input)?;
             match penalty {
