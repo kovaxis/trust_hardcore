@@ -392,7 +392,7 @@ fn run_server(config_path: &Path) -> Result<bool, Box<dyn Error>> {
         }
         //Compare with death messages
         if death_msg.iter().any(|dm| msg.starts_with(dm))
-            && !death_msg.iter().any(|dm| msg.starts_with(dm))
+            && !config.ignore_phrases.iter().any(|dm| msg.starts_with(dm))
         {
             //Player died
             penalty = on_death(&config, &username, &input)?;
